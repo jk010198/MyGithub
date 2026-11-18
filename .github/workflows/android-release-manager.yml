@@ -1,0 +1,356 @@
+
+name: Android AI Release Manager
+
+on:
+  # Runs after changes are pushed to development.
+  # With branch protection, this normally means a PR was merged.
+  push:
+    branches:
+      - development
+
+  # Allows an authorized person to run it manually.
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description: "Optional tag, e.g. v1.2.0. Leave blank for AI."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ==============================================
+  # JOB 1: Build, test and prepare AI release plan
+  # ==============================================
+  analyze:
+    name: Android Build, Tests and AI Analysis
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      commit_sha: ${{ steps.source.outputs.sha }}
+
+    steps:
+      - name: Checkout development
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate source branch
+        id: source
+        env:
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$SOURCE_BRANCH" != "development" ]; then
+            echo "Releases are allowed only from development."
+            exit 1
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Branch: $SOURCE_BRANCH"
+          echo "Commit: $SHA"
+
+      # Android build environment
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      # Validation
+      - name: Run Android unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Build Android debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      # Collect changes since the previous tag
+      - name: Collect Git history
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="$LAST_TAG..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+
+          git log "$RANGE" -n 150 --no-merges \
+            --pretty=format:'%h %s (%an)' > commits.txt
+
+          git log "$RANGE" -n 150 --no-merges \
+            --pretty=format:'%h %s' --stat > changes-full.txt
+
+          head -c 25000 changes-full.txt > changes.txt
+
+          if [ ! -s commits.txt ]; then
+            echo "No new commits since the previous tag."
+            exit 1
+          fi
+
+      # AI release plan
+      - name: Generate AI release plan
+        id: plan
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TAG_OVERRIDE: ${{ inputs.tag_override }}
+          LAST_TAG: ${{ steps.changes.outputs.last_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY secret is missing."
+            exit 1
+          fi
+
+          {
+            echo "You are an expert Android release manager."
+            echo ""
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Branch: development"
+            echo "Previous tag: ${LAST_TAG:-none}"
+            echo "Requested tag override: ${TAG_OVERRIDE:-none}"
+            echo ""
+            echo "Recommend a semantic version in vMAJOR.MINOR.PATCH format."
+            echo "Breaking changes = major; new backward-compatible features = minor;"
+            echo "bug fixes and maintenance = patch."
+            echo "If no previous tag exists, recommend v1.0.0."
+            echo "If an override is supplied, use it exactly."
+            echo "Never invent changes or claim tests passed based on commits."
+            echo "Write concise Markdown release notes."
+            echo "Group notes into Features, Improvements and Bug Fixes."
+            echo "Mention Android, Kotlin, Compose, APIs, SDK and build changes only"
+            echo "when supported by the supplied commit information."
+            echo ""
+            echo "COMMITS:"
+            cat commits.txt
+            echo ""
+            echo "CHANGE STATISTICS:"
+            cat changes.txt
+          } > prompt.txt
+
+          jq -n \
+            --arg model "gpt-4o-mini" \
+            --rawfile prompt prompt.txt \
+            '{
+              model: $model,
+              input: $prompt,
+              text: {
+                format: {
+                  type: "json_schema",
+                  name: "android_release_plan",
+                  strict: true,
+                  schema: {
+                    type: "object",
+                    properties: {
+                      version: {type: "string"},
+                      release_title: {type: "string"},
+                      bump: {
+                        type: "string",
+                        enum: ["major", "minor", "patch", "initial", "override"]
+                      },
+                      change_summary: {type: "string"},
+                      risk_notes: {type: "string"},
+                      release_notes: {type: "string"}
+                    },
+                    required: [
+                      "version",
+                      "release_title",
+                      "bump",
+                      "change_summary",
+                      "risk_notes",
+                      "release_notes"
+                    ],
+                    additionalProperties: false
+                  }
+                }
+              }
+            }' > request.json
+
+          curl --fail-with-body --silent --show-error \
+            https://api.openai.com/v1/responses \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @request.json > response.json
+
+          jq -er '
+            [.output[]?.content[]? |
+              select(.type == "output_text") | .text] |
+            if length > 0 then join("")
+            else error("No AI output received")
+            end
+          ' response.json > release-plan.json
+
+          TAG="$(jq -er '.version' release-plan.json)"
+
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid AI tag: $TAG"
+            exit 1
+          fi
+
+          if [ -n "$TAG_OVERRIDE" ] && [ "$TAG" != "$TAG_OVERRIDE" ]; then
+            echo "AI did not use the requested tag override."
+            exit 1
+          fi
+
+          if git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $TAG"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Android AI Release Plan"
+            echo ""
+            echo "- Branch: development"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Previous tag: ${LAST_TAG:-None}"
+            echo "- Recommended tag: $TAG"
+            echo ""
+            echo "### Version recommendation"
+            jq -r '.bump' release-plan.json
+            echo ""
+            echo "### Change summary"
+            jq -r '.change_summary' release-plan.json
+            echo ""
+            echo "### Risk notes"
+            jq -r '.risk_notes' release-plan.json
+            echo ""
+            echo "### Release notes"
+            jq -r '.release_notes' release-plan.json
+            echo ""
+            echo "### Validation"
+            echo "Gradle unit tests and debug APK build passed."
+            echo ""
+            echo "Publishing is waiting for manual approval."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-plan
+          path: release-plan.json
+          retention-days: 7
+
+  # ==============================================
+  # JOB 2: Approval, Git tag and GitHub Release
+  # ==============================================
+  publish:
+    name: Approve and Publish Android Release
+    needs: analyze
+    runs-on: ubuntu-latest
+
+    environment: production
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout exact tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.analyze.outputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Download AI release plan
+        uses: actions/download-artifact@v4
+        with:
+          name: android-release-plan
+
+      - name: Validate tag
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(jq -er '.version' release-plan.json)"
+
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $TAG"
+            exit 1
+          fi
+
+          if git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $TAG"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create annotated Git tag
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+          TARGET_SHA: ${{ needs.analyze.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" "$TARGET_SHA" -m "Android Release $TAG"
+
+      - name: Push tag to GitHub
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          git push origin "refs/tags/$TAG"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          jq -r '.release_notes' release-plan.json > release-notes.md
+
+          TITLE="$(jq -er '.release_title' release-plan.json)"
+
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes-file release-notes.md \
+            --verify-tag
+
+      - name: Publish release summary
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          {
+            echo "## Android Release Published"
+            echo ""
+            echo "- Tag: $TAG"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Status: Published"
+          } >> "$GITHUB_STEP_SUMMARY"
